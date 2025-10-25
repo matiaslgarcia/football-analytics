@@ -32,6 +32,63 @@ Esta app de Streamlit permite:
    ```
 6. Abre la URL que aparece (ej. `http://localhost:8501`).
 
+## Arquitectura modular
+El código de `src/` está organizado por responsabilidad para lograr desacoplamiento, escalabilidad y claridad.
+
+- `src/models/`
+  - `load_model.py`: carga y cachea el modelo YOLOv8.
+- `src/controllers/`
+  - `process_video.py`: procesamiento completo con detección + tracking.
+  - `process_video_segment.py`: procesamiento de segmento por tiempo.
+  - `clip_video_simple.py`: recorte simple de video sin audio.
+  - `download_game.py`: descarga de videos desde SoccerNet y generación opcional de clips.
+- `src/utils/`
+  - `config.py`: rutas base (`INPUTS_DIR`, `OUTPUTS_DIR`, `VIDEOS_DIR`) y claves de entorno de NDA.
+  - `soccernet_password.py`: resolución de password (`resolve_password`).
+  - `ui/`
+    - `sidebar_processing_controls.py`: controles de procesamiento en barra lateral.
+    - `source_selector.py`: selector de origen del video (subida o SoccerNet local).
+    - `download_controls.py`: expander de descarga de SoccerNet.
+- `src/tests/`
+  - `test_smoke.py`: prueba mínima de importación para verificar estructura.
+
+Cada archivo contiene únicamente funciones ligadas a su propósito. Todas las carpetas tienen `__init__.py` para permitir importaciones correctas.
+
+## Guía rápida de imports
+Ejemplo de cómo importar y usar los módulos desde `app.py`:
+```python
+from pathlib import Path
+from src.models.load_model import load_model
+from src.controllers.process_video import process_video
+from src.controllers.process_video_segment import process_video_segment
+from src.controllers.download_game import download_game
+from src.utils.config import INPUTS_DIR, OUTPUTS_DIR, VIDEOS_DIR
+from src.utils.ui.sidebar_processing_controls import sidebar_processing_controls
+from src.utils.ui.source_selector import source_selector
+from src.utils.ui.download_controls import download_controls
+
+# Cargar modelo
+model = load_model("yolov8n.pt")
+
+# Procesar video completo
+process_video("inputs/partido.mp4", "outputs/result_partido.mp4", model, conf=0.25, only_person=True, img_size=640)
+
+# Procesar segmento
+process_video_segment("inputs/partido.mp4", "outputs/result_seg.mp4", model, conf=0.25, only_person=True, img_size=640, start_s=30.0, duration_s=10.0)
+
+# Descargar desde SoccerNet
+result = download_game(
+    game_path="europe_uefa-champions-league/2016-2017/2017-04-18 - 21-45 Real Madrid 4 - 2 Bayern Munich",
+    quality="720p",
+    half_choice="both",
+    password=None,  # o usa variables de entorno
+    local_dir=VIDEOS_DIR,
+    recortar=True,
+    start_s=0.0,
+    duration_s=10.0,
+)
+```
+
 ## Estructura de carpetas
 - `inputs/`: se guarda el archivo subido antes de procesarlo.
 - `videos/`: videos locales y los descargados desde SoccerNet (estructura liga/temporada/partido).
@@ -45,7 +102,7 @@ Esta app de Streamlit permite:
   - `Procesar solo un segmento`: define `Inicio (seg)` y `Duración (seg)` para analizar sólo ese tramo.
 - Sección "Descargar video de SoccerNet":
   - Ingresa `Ruta del juego (league/season/game)`, `Calidad` (`720p`/`224p`), `Mitad` (`1`/`2`/`both`) y `Password (NDA)`.
-  - Activa `Recortar tras descarga` para generar clips MP4 de X segundos por cada mitad descargada (usando inicio/duración).
+  - Activa `Recortar tras descarga` para generar clips MP4 de X segundos por cada mitad descargada.
   - Los archivos se guardan bajo `videos/<liga>/<temporada>/<partido>/` y aparecen en el selector "SoccerNet local".
 
 ## Descarga vía consola (opcional)
