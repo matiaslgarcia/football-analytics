@@ -570,6 +570,33 @@ def process_video(
     radar_positions_history = {}  # tracker_id -> deque de posiciones (x, y)
     RADAR_SMOOTH_WINDOW = 5       # Ventana de suavizado (5 frames)
 
+    # --- IDENTIFICAR CLASES DEL MODELO ---
+    model_names = player_model.names
+    player_class_ids = []
+    ball_class_ids = []
+    
+    for id, name in model_names.items():
+        name_lower = str(name).lower()
+        # Clases para personas (jugadores, árbitros, porteros, personas genéricas)
+        if any(x in name_lower for x in ['person', 'player', 'goalkeeper', 'referee']):
+            player_class_ids.append(id)
+        # Clases para pelota
+        if any(x in name_lower for x in ['ball', 'sports ball']):
+            ball_class_ids.append(id)
+    
+    # Fallbacks por defecto si no se detectan nombres conocidos
+    if not player_class_ids:
+        # Asumir clase 0 si es un modelo custom desconocido o COCO standard
+        player_class_ids = [0]
+    
+    if not ball_class_ids:
+        # Solo si parece ser COCO (muchas clases), usamos 32
+        if len(model_names) > 30: 
+            ball_class_ids = [32]
+            
+    # print(f"DEBUG: Detecting players with class IDs: {player_class_ids}")
+    # print(f"DEBUG: Detecting ball with class IDs: {ball_class_ids}")
+
     try:
         while True:
             ret, frame = cap.read()
@@ -590,12 +617,10 @@ def process_video(
             )
             player_detections = sv.Detections.from_ultralytics(player_results[0])
             
-            # Filtrar solo clase 0 (personas)
-            # Asumimos que el modelo de jugadores es COCO (clase 0) o Custom (probablemente clase 0)
-            # Si es custom con solo 1 clase, class_id será 0.
-            # Si es COCO, filtramos class_id == 0.
+            # Filtrar clases dinámicamente usando los IDs identificados
             if player_detections.class_id is not None:
-                player_detections = player_detections[player_detections.class_id == 0]
+                mask = np.isin(player_detections.class_id, player_class_ids)
+                player_detections = player_detections[mask]
             
             # --- DETECCIÓN DE PELOTA MEJORADA ---
             ball_detections = sv.Detections.empty()
@@ -625,10 +650,11 @@ def process_video(
                             best_idx = np.argmax(ball_detections.confidence)
                             ball_detections = ball_detections[best_idx:best_idx+1]
                 else:
-                    # Fallback: Usar modelo de jugadores si tiene clase 32 (sports ball)
+                    # Fallback: Usar modelo de jugadores si tiene clase de pelota
                     raw_detections = sv.Detections.from_ultralytics(player_results[0])
-                    if raw_detections.class_id is not None:
-                         ball_detections = raw_detections[raw_detections.class_id == 32]
+                    if raw_detections.class_id is not None and ball_class_ids:
+                         mask = np.isin(raw_detections.class_id, ball_class_ids)
+                         ball_detections = raw_detections[mask]
                          if len(ball_detections) > 0:
                              ball_conf_threshold = max(0.1, conf * 0.3)
                              ball_detections = ball_detections[ball_detections.confidence >= ball_conf_threshold]
