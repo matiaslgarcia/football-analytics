@@ -1,6 +1,13 @@
 streamlit>=1.32.0
 ultralytics>=8.2.0
-supervision>=0.17.0
+git+https://github.com/roboflow/sports.git
 opencv-python>=4.8.0
-numpy>=1.24.0
+numpy>=2.2.0
 SoccerNet>=0.1.62
+supervision>=0.27.0
+transformers>=4.57.0
+umap-learn>=0.5.9
+scikit-learn>=1.7.0
+roboflow>=1.1.0
+tqdm>=4.67.0
+sentencepiece>=0.2.0

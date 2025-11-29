@@ -1,95 +1,153 @@
 import streamlit as st
 from pathlib import Path
-from src.models.load_model import load_model
-from src.controllers.download_game import download_game
+from src.models.load_model import load_roboflow_model
 from src.controllers.process_video import process_video
-from src.controllers.process_video_segment import process_video_segment
-from src.utils.config import INPUTS_DIR, OUTPUTS_DIR, VIDEOS_DIR
-from src.utils.ui.sidebar_processing_controls import sidebar_processing_controls
-from src.utils.ui.source_selector import source_selector
-from src.utils.ui.download_controls import download_controls
+from src.utils.config import INPUTS_DIR, OUTPUTS_DIR
+from ultralytics import YOLO
 
-st.set_page_config(page_title="Detección y tracking de jugadores", layout="centered")
+st.set_page_config(page_title="Soccer Analytics AI", layout="wide")
 
-st.title("Detección y tracking de jugadores (YOLOv8 + Supervision)")
-st.caption("Sube un video de fútbol, detecta jugadores y realiza tracking por ID.")
+st.title("⚽ Soccer Analytics AI")
+st.caption("Detección de jugadores, equipos, pelota y proyección a radar 2D.")
 
-# Controles en la barra lateral
-model_name, conf, only_person, img_size, segment_mode, start_s, duration_s = sidebar_processing_controls()
+# === SIDEBAR CONFIGURATION ===
+st.sidebar.header("⚙️ Configuración")
 
-# NUEVO: Selector de origen de video (Subir archivo o SoccerNet local)
-source_mode, uploaded_file, selected_soccernet_path = source_selector(VIDEOS_DIR)
+# 1. PLAYERS MODEL
+st.sidebar.subheader("1. Jugadores")
+player_source = st.sidebar.radio(
+    "Modelo de Jugadores",
+    ["YOLOv8 Genérico (COCO)", "Subir Modelo Custom (.pt)"],
+    index=0
+)
 
-# load_model movido a src.models.load_model
+player_model = None
+if player_source == "YOLOv8 Genérico (COCO)":
+    # Default to Medium for balance
+    model_size = st.sidebar.selectbox("Tamaño del modelo", ["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x"], index=2)
+    with st.spinner(f"Cargando {model_size}..."):
+        player_model = load_roboflow_model(model_size)
+else:
+    uploaded_player = st.sidebar.file_uploader("Subir modelo jugadores (.pt)", type=["pt"])
+    if uploaded_player:
+        p_path = Path("models") / uploaded_player.name
+        p_path.parent.mkdir(exist_ok=True)
+        with open(p_path, "wb") as f:
+            f.write(uploaded_player.read())
+        player_model = YOLO(p_path)
+        st.sidebar.success(f"Cargado: {uploaded_player.name}")
 
+# 2. BALL MODEL
+st.sidebar.subheader("2. Pelota")
+ball_source = st.sidebar.radio(
+    "Modelo de Pelota",
+    ["Heurística (Clase 'sports ball')", "Subir Modelo Custom (.pt)"],
+    index=0
+)
 
-inputs_dir = INPUTS_DIR
-outputs_dir = OUTPUTS_DIR
+ball_model = None
+if ball_source == "Subir Modelo Custom (.pt)":
+    uploaded_ball = st.sidebar.file_uploader("Subir modelo pelota (.pt)", type=["pt"])
+    if uploaded_ball:
+        b_path = Path("models") / uploaded_ball.name
+        b_path.parent.mkdir(exist_ok=True)
+        with open(b_path, "wb") as f:
+            f.write(uploaded_ball.read())
+        ball_model = YOLO(b_path)
+        st.sidebar.success(f"Cargado: {uploaded_ball.name}")
 
-if st.button("Procesar video"):
-    if source_mode == "Subir archivo":
-        if uploaded_file is None:
-            st.warning("Sube un archivo primero.")
+# 3. RADAR / PITCH
+st.sidebar.subheader("3. Radar View")
+enable_radar = st.sidebar.checkbox("Habilitar Radar", value=False)
+pitch_model = None
+full_field_approx = False
+
+if enable_radar:
+    pitch_source = st.sidebar.radio(
+        "Modelo de Campo",
+        ["Subir Modelo Custom (.pt)", "Aproximación Pantalla Completa (Experimental)"],
+        index=0
+    )
+    
+    if pitch_source == "Subir Modelo Custom (.pt)":
+        uploaded_pitch = st.sidebar.file_uploader("Subir modelo campo (.pt)", type=["pt"])
+        if uploaded_pitch:
+            pi_path = Path("models") / uploaded_pitch.name
+            pi_path.parent.mkdir(exist_ok=True)
+            with open(pi_path, "wb") as f:
+                f.write(uploaded_pitch.read())
+            pitch_model = YOLO(pi_path)
+            st.sidebar.success(f"Cargado: {uploaded_pitch.name}")
         else:
-            in_path = inputs_dir / uploaded_file.name
-            with open(in_path, "wb") as f:
-                f.write(uploaded_file.read())
+            st.sidebar.warning("Sin modelo de campo, el radar no funcionará.")
     else:
-        if selected_soccernet_path is None:
-            st.warning("Selecciona un video de SoccerNet.")
+        st.sidebar.info("ℹ️ Asume que los 4 bordes del video coinciden con los 4 bordes del campo.")
+        full_field_approx = True
+
+# === MAIN AREA ===
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("📺 Video de Entrada")
+    uploaded_video = st.file_uploader("Arrastra un video aquí", type=["mp4", "mov", "avi"])
+
+if uploaded_video:
+    # Save input video
+    input_path = INPUTS_DIR / uploaded_video.name
+    INPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(input_path, "wb") as f:
+        f.write(uploaded_video.read())
+    
+    with col1:
+        st.video(str(input_path))
+
+    # Process Button
+    if st.button("🚀 Iniciar Procesamiento", type="primary"):
+        if player_model is None:
+            st.error("❌ Debes cargar un modelo de jugadores (o usar el genérico).")
         else:
-            in_path = selected_soccernet_path
+            with col2:
+                st.subheader("⚙️ Procesando...")
+                status_text = st.empty()
+                progress_bar = st.progress(0)
+                
+                output_filename = f"processed_{uploaded_video.name}"
+                target_path = OUTPUTS_DIR / output_filename
+                OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    if 'in_path' in locals():
-        out_stem = Path(in_path).stem
-        if segment_mode:
-            out_path = outputs_dir / f"result_{out_stem}_seg_{int(start_s)}-{int(duration_s)}.mp4"
-        else:
-            out_path = outputs_dir / f"result_{out_stem}.mp4"
+                try:
+                    status_text.text("Iniciando motor de IA...")
+                    
+                    # Pass full_field_approx to process_video (we need to update process_video signature or handle it)
+                    # To keep it clean, we'll pass a special flag or handle it inside process_video
+                    # Let's modify process_video to accept a config dict or specific arg
+                    
+                    process_video(
+                        source_path=str(input_path),
+                        target_path=str(target_path),
+                        player_model=player_model,
+                        ball_model=ball_model,
+                        pitch_model=pitch_model,
+                        conf=0.3,
+                        detection_mode="players_and_ball",
+                        full_field_approx=full_field_approx  # We will add this argument
+                    )
+                    
+                    progress_bar.progress(100)
+                    status_text.success("✅ ¡Procesamiento completado!")
+                    st.video(str(target_path))
+                    
+                    with open(target_path, "rb") as f:
+                        st.download_button(
+                            "⬇️ Descargar Video Procesado",
+                            f,
+                            file_name=output_filename
+                        )
+                        
+                except Exception as e:
+                    st.error(f"Ocurrió un error: {str(e)}")
+                    import traceback
+                    st.code(traceback.format_exc())
 
-        with st.spinner("Procesando el video, esto puede tardar..."):
-            model = load_model(model_name)
-            if segment_mode:
-                process_video_segment(
-                    str(in_path), str(out_path), model,
-                    conf=conf, only_person=only_person, img_size=img_size,
-                    start_s=float(start_s), duration_s=float(duration_s)
-                )
-            else:
-                process_video(str(in_path), str(out_path), model, conf=conf, only_person=only_person, img_size=img_size)
-
-        st.success("Listo: procesamiento completado.")
-        st.video(str(out_path))
-        with open(out_path, "rb") as f:
-            st.download_button(
-                label="Descargar video anotado",
-                data=f,
-                file_name=Path(out_path).name,
-                mime="video/mp4"
-            )
-    else:
-        st.stop()
-
-default_game = "europe_uefa-champions-league/2016-2017/2017-04-18 - 21-45 Real Madrid 4 - 2 Bayern Munich"
-game_path, quality_download, half_choice, password_download, recortar_download, start_dl_s, duration_dl_s, clicked = download_controls(default_game)
-if clicked:
-    try:
-        with st.spinner("Descargando desde SoccerNet, puede tardar..."):
-            result = download_game(
-                game_path=game_path,
-                quality=quality_download,
-                half_choice=half_choice,
-                password=password_download or None,
-                local_dir=VIDEOS_DIR,
-                recortar=recortar_download,
-                start_s=float(start_dl_s),
-                duration_s=float(duration_dl_s),
-            )
-        if recortar_download and len(result["clips"]) > 0:
-            st.success(f"Descarga y recorte completados. Clips creados: {len(result['clips'])}")
-        else:
-            st.success("Descarga completada. Los archivos están en `videos/`.")
-
-        st.experimental_rerun()
-    except Exception as e:
-        st.error(f"Error al descargar: {e}")
+else:
+    st.info("👈 Sube un video para comenzar.")
