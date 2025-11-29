@@ -570,32 +570,47 @@ def process_video(
     radar_positions_history = {}  # tracker_id -> deque de posiciones (x, y)
     RADAR_SMOOTH_WINDOW = 5       # Ventana de suavizado (5 frames)
 
-    # --- IDENTIFICAR CLASES DEL MODELO ---
-    model_names = player_model.names
+    # --- IDENTIFICAR CLASES DEL MODELO DE JUGADORES ---
+    player_model_names = player_model.names
     player_class_ids = []
-    ball_class_ids = []
+    # Fallback ball class IDs from player model (if ball model is missing)
+    player_model_ball_class_ids = [] 
     
-    for id, name in model_names.items():
+    for id, name in player_model_names.items():
         name_lower = str(name).lower()
         # Clases para personas (jugadores, árbitros, porteros, personas genéricas)
         if any(x in name_lower for x in ['person', 'player', 'goalkeeper', 'referee']):
             player_class_ids.append(id)
-        # Clases para pelota
+        # Clases para pelota en el modelo de jugadores
         if any(x in name_lower for x in ['ball', 'sports ball']):
-            ball_class_ids.append(id)
+            player_model_ball_class_ids.append(id)
     
     # Fallbacks por defecto si no se detectan nombres conocidos
     if not player_class_ids:
         # Asumir clase 0 si es un modelo custom desconocido o COCO standard
         player_class_ids = [0]
     
-    if not ball_class_ids:
+    if not player_model_ball_class_ids:
         # Solo si parece ser COCO (muchas clases), usamos 32
-        if len(model_names) > 30: 
-            ball_class_ids = [32]
+        if len(player_model_names) > 30: 
+            player_model_ball_class_ids = [32]
             
-    # print(f"DEBUG: Detecting players with class IDs: {player_class_ids}")
-    # print(f"DEBUG: Detecting ball with class IDs: {ball_class_ids}")
+    # --- IDENTIFICAR CLASES DEL MODELO DE PELOTA (si existe) ---
+    ball_model_class_ids = []
+    if ball_model:
+        for id, name in ball_model.names.items():
+            name_lower = str(name).lower()
+            if any(x in name_lower for x in ['ball', 'sports ball']):
+                ball_model_class_ids.append(id)
+        
+        # Fallback si no se encuentra nombre explícito
+        if not ball_model_class_ids:
+            # Si es modelo de 1 sola clase, asumimos que es la pelota
+            if len(ball_model.names) == 1:
+                ball_model_class_ids = [0]
+            # Si parece ser COCO
+            elif len(ball_model.names) > 30:
+                ball_model_class_ids = [32]
 
     try:
         while True:
@@ -635,6 +650,11 @@ def process_video(
                         verbose=False
                     )
                     ball_detections = sv.Detections.from_ultralytics(ball_results[0])
+                    
+                    # Filtrar clases válidas del modelo de pelota
+                    if ball_detections.class_id is not None and ball_model_class_ids:
+                         mask = np.isin(ball_detections.class_id, ball_model_class_ids)
+                         ball_detections = ball_detections[mask]
 
                     # Post-procesamiento: Filtrar por tamaño (pelotas muy grandes = falsos positivos)
                     if len(ball_detections) > 0:
@@ -652,8 +672,8 @@ def process_video(
                 else:
                     # Fallback: Usar modelo de jugadores si tiene clase de pelota
                     raw_detections = sv.Detections.from_ultralytics(player_results[0])
-                    if raw_detections.class_id is not None and ball_class_ids:
-                         mask = np.isin(raw_detections.class_id, ball_class_ids)
+                    if raw_detections.class_id is not None and player_model_ball_class_ids:
+                         mask = np.isin(raw_detections.class_id, player_model_ball_class_ids)
                          ball_detections = raw_detections[mask]
                          if len(ball_detections) > 0:
                              ball_conf_threshold = max(0.1, conf * 0.3)
