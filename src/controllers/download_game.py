@@ -25,10 +25,13 @@ def download_game(
     recortar: bool = False,
     start_s: float = 0.0,
     duration_s: float = 10.0,
+    download_calibration: bool = True,
 ) -> Dict[str, List[Path]]:
-    """Descarga un juego de SoccerNet y opcionalmente recorta clips de los halves descargados.
+    """Descarga un juego de SoccerNet y opcionalmente:
+    - Recorta clips
+    - Descarga calibraciones de campo por mitad para mejorar homografía
 
-    Retorna un dict con claves: files (archivos descargados), clips (clips generados), game_dir.
+    Retorna un dict con claves: files (videos), calibration (jsons), clips (clips generados), game_dir.
     """
     videos_dir = Path(local_dir)
     videos_dir.mkdir(exist_ok=True)
@@ -40,10 +43,18 @@ def download_game(
     downloader.password = pw
 
     # Estructura del path: league/season/game_id
-    downloader.downloadGame(files=files, game=game_path)
+    calibration_files: List[str] = []
+    if download_calibration:
+        if half_choice in ("1", "both"):
+            calibration_files.append("1_field_calib_ccbv.json")
+        if half_choice in ("2", "both"):
+            calibration_files.append("2_field_calib_ccbv.json")
+    all_files = files + calibration_files if download_calibration else files
+    downloader.downloadGame(files=all_files, game=game_path)
 
     game_dir = videos_dir / Path(game_path)
     downloaded_paths = [game_dir / f for f in files]
+    calibration_paths = [game_dir / f for f in calibration_files] if download_calibration else []
 
     clips: List[Path] = []
     if recortar:
@@ -56,4 +67,4 @@ def download_game(
             clip_video_simple(str(src), str(dst), float(start_s), float(duration_s))
             clips.append(dst)
 
-    return {"files": downloaded_paths, "clips": clips, "game_dir": game_dir}
+    return {"files": downloaded_paths, "calibration": calibration_paths, "clips": clips, "game_dir": game_dir}
