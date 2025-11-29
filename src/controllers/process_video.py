@@ -142,9 +142,9 @@ def is_in_goal_area(bbox: np.ndarray, frame_width: int, frame_height: int) -> bo
     center_y = (y1 + y2) / 2
     bbox_height = y2 - y1
 
-    # Área de gol más estricta: 10% de cada lado del campo
-    left_goal_area = frame_width * 0.10
-    right_goal_area = frame_width * 0.90
+    # Área de gol más estricta: 5% de cada lado del campo
+    left_goal_area = frame_width * 0.05
+    right_goal_area = frame_width * 0.95
 
     # Verificaciones mejoradas:
     # 1. Debe estar en la zona del campo (no en marcadores o cielo)
@@ -299,8 +299,8 @@ def cluster_teams(frame: np.ndarray, detections: sv.Detections, frame_width: int
             referee_score -= 3  # Penalizar blanco fuertemente
 
         # Score mínimo más alto para clasificar como árbitro
-        # Antes: >= 3, Ahora: >= 5
-        if referee_score >= 5:
+        # Antes: >= 3, Ahora: >= 6
+        if referee_score >= 6:
             referee_candidates.append(data)
         else:
             player_candidates.append(data)
@@ -389,18 +389,29 @@ def classify_person_smart(
 
     in_goal_area = is_in_goal_area(bbox, frame_width, frame_height)
 
-    # Si está en área de gol cerca de los extremos, probablemente es portero
-    # Ampliado a 12% para cubrir mejor el área chica
-    if in_goal_area:
-        x_center = (bbox[0] + bbox[2]) / 2
-        if x_center < frame_width * 0.12:
-            return ('goalkeeper', 1)
-        elif x_center > frame_width * 0.88:
-            return ('goalkeeper', 2)
-
-    # Calcular distancias a colores de equipos (usando camiseta principalmente)
+    # Calcular distancias a colores de equipos (MOVIDO ARRIBA para verificación de portero)
     dist_team1_shirt = np.linalg.norm(person_shirt - team1_colors['shirt'])
     dist_team2_shirt = np.linalg.norm(person_shirt - team2_colors['shirt'])
+
+    # Si está en área de gol cerca de los extremos, probablemente es portero
+    # Ampliado a 5% para cubrir mejor el área chica (ajustado de 12%)
+    if in_goal_area:
+        x_center = (bbox[0] + bbox[2]) / 2
+        is_left_gk = x_center < frame_width * 0.05
+        is_right_gk = x_center > frame_width * 0.95
+        
+        if is_left_gk or is_right_gk:
+             # VERIFICACIÓN DE COLOR: El portero debe tener color distinto a los equipos
+             # Si el color es muy similar a alguno de los equipos (< 45), es probable que sea un jugador en la banda
+             min_dist_to_teams = min(dist_team1_shirt, dist_team2_shirt)
+             
+             # Solo clasificamos como portero si el color es suficientemente distinto
+             if min_dist_to_teams > 45:
+                 if is_left_gk:
+                     return ('goalkeeper', 1)
+                 else:
+                     return ('goalkeeper', 2)
+             # Si es muy similar, continuamos a la clasificación normal
 
     # Detectar árbitros con criterio mejorado v3.3:
     # 1. Alta varianza de color (camiseta diferente de pantalón)
@@ -555,6 +566,10 @@ def process_video(
     track_history = {}
     HISTORY_LEN = 30
 
+    # Suavizado temporal para posiciones en radar
+    radar_positions_history = {}  # tracker_id -> deque de posiciones (x, y)
+    RADAR_SMOOTH_WINDOW = 5       # Ventana de suavizado (5 frames)
+
     try:
         while True:
             ret, frame = cap.read()
@@ -582,32 +597,53 @@ def process_video(
             if player_detections.class_id is not None:
                 player_detections = player_detections[player_detections.class_id == 0]
             
-            # --- DETECCIÓN DE PELOTA ---
+            # --- DETECCIÓN DE PELOTA MEJORADA ---
             ball_detections = sv.Detections.empty()
             if detection_mode in ["ball_only", "players_and_ball"]:
                 if ball_model:
-                    # Usar modelo específico de pelota
+                    # Usar modelo específico de pelota con parámetros optimizados
                     ball_results = ball_model.predict(
                         frame,
-                        conf=max(0.15, conf * 0.4), # Umbral más bajo para pelota
-                        iou=0.3,
+                        conf=max(0.1, conf * 0.3),  # Umbral aún más bajo (10% mínimo)
+                        iou=0.4,                     # IoU más permisivo para pelota
                         imgsz=img_size,
                         verbose=False
                     )
                     ball_detections = sv.Detections.from_ultralytics(ball_results[0])
-                    # No filtramos clase aquí, asumimos que el modelo de pelota detecta la pelota
+
+                    # Post-procesamiento: Filtrar por tamaño (pelotas muy grandes = falsos positivos)
+                    if len(ball_detections) > 0:
+                        areas = (ball_detections.xyxy[:, 2] - ball_detections.xyxy[:, 0]) * \
+                                (ball_detections.xyxy[:, 3] - ball_detections.xyxy[:, 1])
+                        max_ball_area = (width * 0.05) * (height * 0.05)  # Máximo 5% del frame
+                        min_ball_area = (width * 0.005) * (height * 0.005)  # Mínimo 0.5% del frame
+                        valid_size = (areas < max_ball_area) & (areas > min_ball_area)
+                        ball_detections = ball_detections[valid_size]
+
+                        # Si hay múltiples detecciones, tomar la de mayor confianza
+                        if len(ball_detections) > 1:
+                            best_idx = np.argmax(ball_detections.confidence)
+                            ball_detections = ball_detections[best_idx:best_idx+1]
                 else:
                     # Fallback: Usar modelo de jugadores si tiene clase 32 (sports ball)
-                    # Necesitamos correr predict otra vez? No, ya corrimos.
-                    # Pero arriba filtramos class_id == 0.
-                    # Recuperemos del raw result si es necesario.
                     raw_detections = sv.Detections.from_ultralytics(player_results[0])
                     if raw_detections.class_id is not None:
                          ball_detections = raw_detections[raw_detections.class_id == 32]
-                         # Filtrar por confianza más baja si es necesario
                          if len(ball_detections) > 0:
-                             ball_conf_threshold = max(0.15, conf * 0.4)
+                             ball_conf_threshold = max(0.1, conf * 0.3)
                              ball_detections = ball_detections[ball_detections.confidence >= ball_conf_threshold]
+
+                             # Mismo post-procesamiento
+                             areas = (ball_detections.xyxy[:, 2] - ball_detections.xyxy[:, 0]) * \
+                                     (ball_detections.xyxy[:, 3] - ball_detections.xyxy[:, 1])
+                             max_ball_area = (width * 0.05) * (height * 0.05)
+                             min_ball_area = (width * 0.005) * (height * 0.005)
+                             valid_size = (areas < max_ball_area) & (areas > min_ball_area)
+                             ball_detections = ball_detections[valid_size]
+
+                             if len(ball_detections) > 1:
+                                 best_idx = np.argmax(ball_detections.confidence)
+                                 ball_detections = ball_detections[best_idx:best_idx+1]
 
             # --- TRACKING DE JUGADORES ---
             tracked_persons = person_tracker.update_with_detections(player_detections)
@@ -768,55 +804,105 @@ def process_video(
                     except Exception as e:
                         print(f"Error en inferencia de pitch: {e}")
 
-                # Caso B: Aproximación de Campo Completo (Experimental)
+                # Caso B: Aproximación de Campo Completo (MEJORADA)
                 elif full_field_approx:
-                    # Asumimos que los 4 bordes de la imagen son los 4 bordes del campo
-                    # Keypoints estándar (0: TL, 1: TR, 2: BR, 3: BL)
+                    # Mejora: Usar márgenes para ajustar mejor la vista de cámara
+                    # Las cámaras de broadcast no muestran exactamente el campo completo
+                    # Típicamente hay ~5-10% de margen en los bordes
+
+                    # Detectar si hay más campo arriba (cielo/público) o abajo (línea)
+                    # Asumimos vista típica de broadcast: más espacio arriba
+                    margin_top = height * 0.15     # 15% superior es cielo/público
+                    margin_bottom = height * 0.05   # 5% inferior es fuera del campo
+                    margin_left = width * 0.08      # 8% lateral (bancas)
+                    margin_right = width * 0.08     # 8% lateral
+
                     source_points = np.array([
-                        [0, 0],         # Top-Left
-                        [width, 0],     # Top-Right
-                        [width, height],# Bottom-Right
-                        [0, height]     # Bottom-Left
-                    ])
+                        [margin_left, margin_top],                          # Top-Left (ajustado)
+                        [width - margin_right, margin_top],                 # Top-Right (ajustado)
+                        [width - margin_right, height - margin_bottom],     # Bottom-Right (ajustado)
+                        [margin_left, height - margin_bottom]               # Bottom-Left (ajustado)
+                    ], dtype=np.float32)
+
+                    # Mapear a las esquinas del campo
+                    # Campo estándar: 105m x 68m
                     target_points = np.array([
-                        pitch_config.keypoints_map[0],
-                        pitch_config.keypoints_map[1],
-                        pitch_config.keypoints_map[2],
-                        pitch_config.keypoints_map[3]
-                    ])
+                        pitch_config.keypoints_map[0],  # Top-Left corner
+                        pitch_config.keypoints_map[1],  # Top-Right corner
+                        pitch_config.keypoints_map[2],  # Bottom-Right corner
+                        pitch_config.keypoints_map[3]   # Bottom-Left corner
+                    ], dtype=np.float32)
+
                     transformer = ViewTransformer(source_points, target_points)
 
                 # Si tenemos un transformer válido, proyectamos y dibujamos
                 if transformer:
                     try:
                         points_to_transform = {}
-                        
+
                         def get_bottom_center(dets):
                             return np.column_stack([
                                 (dets.xyxy[:, 0] + dets.xyxy[:, 2]) / 2,
                                 dets.xyxy[:, 3]
                             ])
 
+                        def smooth_positions(tracker_ids, raw_positions):
+                            """Suaviza posiciones usando promedio móvil."""
+                            smoothed = []
+                            for tid, pos in zip(tracker_ids, raw_positions):
+                                if tid not in radar_positions_history:
+                                    radar_positions_history[tid] = deque(maxlen=RADAR_SMOOTH_WINDOW)
+
+                                radar_positions_history[tid].append(pos)
+                                # Promedio de las últimas N posiciones
+                                avg_pos = np.mean(list(radar_positions_history[tid]), axis=0)
+                                smoothed.append(avg_pos)
+                            return np.array(smoothed)
+
+                        # Transformar y suavizar team1
                         if any(team1_mask):
-                            points_to_transform['team1'] = transformer.transform_points(
-                                get_bottom_center(tracked_persons[np.array(team1_mask)])
-                            )
+                            t1_dets = tracked_persons[np.array(team1_mask)]
+                            raw_pos = transformer.transform_points(get_bottom_center(t1_dets))
+                            if t1_dets.tracker_id is not None:
+                                points_to_transform['team1'] = smooth_positions(t1_dets.tracker_id, raw_pos)
+                            else:
+                                points_to_transform['team1'] = raw_pos
+
+                        # Transformar y suavizar team2
                         if any(team2_mask):
-                            points_to_transform['team2'] = transformer.transform_points(
-                                get_bottom_center(tracked_persons[np.array(team2_mask)])
-                            )
+                            t2_dets = tracked_persons[np.array(team2_mask)]
+                            raw_pos = transformer.transform_points(get_bottom_center(t2_dets))
+                            if t2_dets.tracker_id is not None:
+                                points_to_transform['team2'] = smooth_positions(t2_dets.tracker_id, raw_pos)
+                            else:
+                                points_to_transform['team2'] = raw_pos
+
+                        # Transformar árbitros (sin suavizar mucho ya que se mueven menos)
                         if any(referee_mask):
+                            ref_dets = tracked_persons[np.array(referee_mask)]
                             points_to_transform['referee'] = transformer.transform_points(
-                                get_bottom_center(tracked_persons[np.array(referee_mask)])
+                                get_bottom_center(ref_dets)
                             )
+
+                        # Transformar porteros
                         if any(goalkeeper_mask):
+                            gk_dets = tracked_persons[np.array(goalkeeper_mask)]
                             points_to_transform['goalkeeper'] = transformer.transform_points(
-                                get_bottom_center(tracked_persons[np.array(goalkeeper_mask)])
+                                get_bottom_center(gk_dets)
                             )
+
+                        # Transformar pelota (suavizado agresivo por su movimiento rápido)
                         if tracked_ball is not None and len(tracked_ball) > 0:
-                            points_to_transform['ball'] = transformer.transform_points(
-                                get_bottom_center(tracked_ball)
-                            )
+                            raw_ball_pos = transformer.transform_points(get_bottom_center(tracked_ball))
+                            if tracked_ball.tracker_id is not None and len(tracked_ball.tracker_id) > 0:
+                                ball_tid = tracked_ball.tracker_id[0]
+                                if ball_tid not in radar_positions_history:
+                                    radar_positions_history[ball_tid] = deque(maxlen=3)  # Ventana más corta para pelota
+                                radar_positions_history[ball_tid].append(raw_ball_pos[0])
+                                smooth_ball = np.mean(list(radar_positions_history[ball_tid]), axis=0)
+                                points_to_transform['ball'] = np.array([smooth_ball])
+                            else:
+                                points_to_transform['ball'] = raw_ball_pos
                             
                         radar_view = draw_radar_view(pitch_config, points_to_transform)
                         

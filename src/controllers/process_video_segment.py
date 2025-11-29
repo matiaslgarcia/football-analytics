@@ -92,6 +92,11 @@ def process_video_segment(
     track_history = {}
     HISTORY_LEN = 30
 
+    # NUEVO: Historial de posiciones para suavizado temporal en radar
+    radar_positions_history = {}
+    RADAR_SMOOTH_WINDOW = 5  # 5 frames para jugadores
+    RADAR_SMOOTH_WINDOW_BALL = 3  # 3 frames para pelota (más rápido)
+
     # Inicializar configuración de pitch si hay modelo
     pitch_config = None
     if pitch_model:
@@ -125,28 +130,63 @@ def process_video_segment(
             if player_detections.class_id is not None:
                 player_detections = player_detections[player_detections.class_id == 0]
 
-            # --- DETECCIÓN DE PELOTA ---
+            # --- DETECCIÓN DE PELOTA MEJORADA ---
             ball_detections = sv.Detections.empty()
             if detection_mode in ["ball_only", "players_and_ball"]:
                 if ball_model:
-                    # Usar modelo específico de pelota
+                    # Usar modelo específico de pelota con umbral más bajo
                     ball_results = ball_model.predict(
                         frame,
-                        conf=max(0.15, conf * 0.4), # Umbral más bajo para pelota
-                        iou=0.3,
+                        conf=max(0.1, conf * 0.3),  # Bajado de 0.15 a 0.1 (10% mínimo)
+                        iou=0.4,  # Más permisivo (era 0.3)
                         imgsz=img_size,
                         verbose=False
                     )
                     ball_detections = sv.Detections.from_ultralytics(ball_results[0])
+
+                    # Post-procesamiento: Filtrado por tamaño
+                    if len(ball_detections) > 0:
+                        # Calcular áreas de detecciones
+                        widths = ball_detections.xyxy[:, 2] - ball_detections.xyxy[:, 0]
+                        heights = ball_detections.xyxy[:, 3] - ball_detections.xyxy[:, 1]
+                        areas = widths * heights
+
+                        # Filtrar por tamaño razonable (entre 0.5% y 5% del frame)
+                        max_ball_area = (width * 0.05) * (height * 0.05)
+                        min_ball_area = (width * 0.005) * (height * 0.005)
+                        valid_size = (areas < max_ball_area) & (areas > min_ball_area)
+
+                        ball_detections = ball_detections[valid_size]
+
+                        # Si hay múltiples detecciones, tomar la de mayor confianza
+                        if len(ball_detections) > 1:
+                            best_idx = np.argmax(ball_detections.confidence)
+                            ball_detections = ball_detections[best_idx:best_idx+1]
                 else:
                     # Fallback: Usar modelo de jugadores si tiene clase 32 (sports ball)
-                    # Nota: Esto asume que player_model es un modelo COCO estándar que incluye 'sports ball'
                     raw_detections = sv.Detections.from_ultralytics(player_results[0])
                     if raw_detections.class_id is not None:
                          ball_detections = raw_detections[raw_detections.class_id == 32]
                          if len(ball_detections) > 0:
-                             ball_conf_threshold = max(0.15, conf * 0.4)
+                             # Aplicar mismo umbral más bajo
+                             ball_conf_threshold = max(0.1, conf * 0.3)
                              ball_detections = ball_detections[ball_detections.confidence >= ball_conf_threshold]
+
+                             # Post-procesamiento por tamaño (igual que modelo específico)
+                             widths = ball_detections.xyxy[:, 2] - ball_detections.xyxy[:, 0]
+                             heights = ball_detections.xyxy[:, 3] - ball_detections.xyxy[:, 1]
+                             areas = widths * heights
+
+                             max_ball_area = (width * 0.05) * (height * 0.05)
+                             min_ball_area = (width * 0.005) * (height * 0.005)
+                             valid_size = (areas < max_ball_area) & (areas > min_ball_area)
+
+                             ball_detections = ball_detections[valid_size]
+
+                             # Tomar mejor detección si hay múltiples
+                             if len(ball_detections) > 1:
+                                 best_idx = np.argmax(ball_detections.confidence)
+                                 ball_detections = ball_detections[best_idx:best_idx+1]
 
             # --- MEJORA: Tracking PRIMERO ---
             tracked_persons = person_tracker.update_with_detections(player_detections)
@@ -295,51 +335,91 @@ def process_video_segment(
                 ball_labels = ["BALL"] * len(tracked_ball)
                 annotated_frame = ball_label_annotator.annotate(scene=annotated_frame, detections=tracked_ball, labels=ball_labels)
 
-            # --- RADAR ---
+            # --- RADAR CON SUAVIZADO TEMPORAL ---
             if pitch_model:
                 try:
                     pitch_results = pitch_model(frame, verbose=False, conf=0.3)[0]
                     if pitch_results.keypoints is not None and len(pitch_results.keypoints) > 0:
                         keypoints_xy = pitch_results.keypoints.xy.cpu().numpy()[0]
                         keypoints_conf = pitch_results.keypoints.conf.cpu().numpy()[0]
-                        
+
                         valid_kp_mask = keypoints_conf > 0.5
                         valid_keypoints = keypoints_xy[valid_kp_mask]
                         valid_indices = np.where(valid_kp_mask)[0]
-                        
+
                         if len(valid_keypoints) >= 4:
                             target_points = pitch_config.get_keypoints_from_ids(valid_indices)
                             transformer = ViewTransformer(valid_keypoints, target_points)
-                            
+
                             points_to_transform = {}
-                            
+
                             def get_bottom_center(dets):
                                 return np.column_stack([
                                     (dets.xyxy[:, 0] + dets.xyxy[:, 2]) / 2,
                                     dets.xyxy[:, 3]
                                 ])
 
+                            def smooth_positions(tracker_ids, raw_positions, window_size):
+                                """Suaviza posiciones usando promedio móvil por tracker_id"""
+                                if len(tracker_ids) == 0 or len(raw_positions) == 0:
+                                    return raw_positions
+
+                                smoothed = []
+                                for tid, pos in zip(tracker_ids, raw_positions):
+                                    key = f"{tid}"
+                                    if key not in radar_positions_history:
+                                        radar_positions_history[key] = deque(maxlen=window_size)
+
+                                    radar_positions_history[key].append(pos)
+                                    avg_pos = np.mean(list(radar_positions_history[key]), axis=0)
+                                    smoothed.append(avg_pos)
+
+                                return np.array(smoothed)
+
+                            # Transformar y suavizar Team 1
                             if any(team1_mask):
-                                points_to_transform['team1'] = transformer.transform_points(
-                                    get_bottom_center(tracked_persons[np.array(team1_mask)])
-                                )
+                                t1_dets = tracked_persons[np.array(team1_mask)]
+                                t1_raw = transformer.transform_points(get_bottom_center(t1_dets))
+                                if t1_dets.tracker_id is not None:
+                                    points_to_transform['team1'] = smooth_positions(
+                                        t1_dets.tracker_id, t1_raw, RADAR_SMOOTH_WINDOW
+                                    )
+                                else:
+                                    points_to_transform['team1'] = t1_raw
+
+                            # Transformar y suavizar Team 2
                             if any(team2_mask):
-                                points_to_transform['team2'] = transformer.transform_points(
-                                    get_bottom_center(tracked_persons[np.array(team2_mask)])
-                                )
+                                t2_dets = tracked_persons[np.array(team2_mask)]
+                                t2_raw = transformer.transform_points(get_bottom_center(t2_dets))
+                                if t2_dets.tracker_id is not None:
+                                    points_to_transform['team2'] = smooth_positions(
+                                        t2_dets.tracker_id, t2_raw, RADAR_SMOOTH_WINDOW
+                                    )
+                                else:
+                                    points_to_transform['team2'] = t2_raw
+
+                            # Referee (sin suavizado, se mueven menos)
                             if any(referee_mask):
                                 points_to_transform['referee'] = transformer.transform_points(
                                     get_bottom_center(tracked_persons[np.array(referee_mask)])
                                 )
+
+                            # Goalkeeper (sin suavizado, se mueven menos)
                             if any(goalkeeper_mask):
                                 points_to_transform['goalkeeper'] = transformer.transform_points(
                                     get_bottom_center(tracked_persons[np.array(goalkeeper_mask)])
                                 )
+
+                            # Ball con ventana más corta (movimiento rápido)
                             if tracked_ball is not None and len(tracked_ball) > 0:
-                                points_to_transform['ball'] = transformer.transform_points(
-                                    get_bottom_center(tracked_ball)
-                                )
-                                
+                                ball_raw = transformer.transform_points(get_bottom_center(tracked_ball))
+                                if tracked_ball.tracker_id is not None:
+                                    points_to_transform['ball'] = smooth_positions(
+                                        tracked_ball.tracker_id, ball_raw, RADAR_SMOOTH_WINDOW_BALL
+                                    )
+                                else:
+                                    points_to_transform['ball'] = ball_raw
+
                             radar_view = draw_radar_view(pitch_config, points_to_transform)
                             
                             # Overlay PIP
