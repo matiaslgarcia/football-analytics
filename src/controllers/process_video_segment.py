@@ -12,6 +12,7 @@ from src.controllers.process_video import (
 )
 from src.utils.view_transformer import ViewTransformer
 from src.utils.radar import SoccerPitchConfiguration, draw_radar_view
+from src.utils.soccernet_homography import load_homography_for_video, load_homography_provider
 from ultralytics import YOLO
 
 def process_video_segment(
@@ -43,6 +44,8 @@ def process_video_segment(
     """
     source_path = str(source_path)
     target_path = str(target_path)
+    soccernet_H = load_homography_for_video(source_path)
+    soccernet_provider = load_homography_provider(source_path)
 
     cap = cv2.VideoCapture(source_path)
     if not cap.isOpened():
@@ -99,7 +102,7 @@ def process_video_segment(
 
     # Inicializar configuración de pitch si hay modelo
     pitch_config = None
-    if pitch_model:
+    if pitch_model or soccernet_H is not None:
         pitch_config = SoccerPitchConfiguration()
 
     # Ir al frame inicial
@@ -336,106 +339,114 @@ def process_video_segment(
                 annotated_frame = ball_label_annotator.annotate(scene=annotated_frame, detections=tracked_ball, labels=ball_labels)
 
             # --- RADAR CON SUAVIZADO TEMPORAL ---
-            if pitch_model:
+            if pitch_config:
                 try:
-                    pitch_results = pitch_model(frame, verbose=False, conf=0.3)[0]
-                    if pitch_results.keypoints is not None and len(pitch_results.keypoints) > 0:
-                        keypoints_xy = pitch_results.keypoints.xy.cpu().numpy()[0]
-                        keypoints_conf = pitch_results.keypoints.conf.cpu().numpy()[0]
+                    transformer = None
+                    if soccernet_provider is not None:
+                        m = soccernet_provider.get_for_time((start_frame + processed) / fps)
+                        if m is not None:
+                            transformer = ViewTransformer.from_matrix(m)
+                    elif soccernet_H is not None:
+                        transformer = ViewTransformer.from_matrix(soccernet_H)
+                    if transformer is None and pitch_model:
+                        pitch_results = pitch_model(frame, verbose=False, conf=0.3)[0]
+                        if pitch_results.keypoints is not None and len(pitch_results.keypoints) > 0:
+                            keypoints_xy = pitch_results.keypoints.xy.cpu().numpy()[0]
+                            keypoints_conf = pitch_results.keypoints.conf.cpu().numpy()[0]
 
-                        valid_kp_mask = keypoints_conf > 0.5
-                        valid_keypoints = keypoints_xy[valid_kp_mask]
-                        valid_indices = np.where(valid_kp_mask)[0]
+                            valid_kp_mask = keypoints_conf > 0.5
+                            valid_keypoints = keypoints_xy[valid_kp_mask]
+                            valid_indices = np.where(valid_kp_mask)[0]
 
-                        if len(valid_keypoints) >= 4:
-                            target_points = pitch_config.get_keypoints_from_ids(valid_indices)
-                            transformer = ViewTransformer(valid_keypoints, target_points)
+                            if len(valid_keypoints) >= 4:
+                                target_points = pitch_config.get_keypoints_from_ids(valid_indices)
+                                transformer = ViewTransformer(valid_keypoints, target_points)
 
-                            points_to_transform = {}
+                    points_to_transform = {}
 
-                            def get_bottom_center(dets):
-                                return np.column_stack([
-                                    (dets.xyxy[:, 0] + dets.xyxy[:, 2]) / 2,
-                                    dets.xyxy[:, 3]
-                                ])
+                    def get_bottom_center(dets):
+                        return np.column_stack([
+                            (dets.xyxy[:, 0] + dets.xyxy[:, 2]) / 2,
+                            dets.xyxy[:, 3]
+                        ])
 
-                            def smooth_positions(tracker_ids, raw_positions, window_size):
-                                """Suaviza posiciones usando promedio móvil por tracker_id"""
-                                if len(tracker_ids) == 0 or len(raw_positions) == 0:
-                                    return raw_positions
+                    def smooth_positions(tracker_ids, raw_positions, window_size):
+                        """Suaviza posiciones usando promedio móvil por tracker_id"""
+                        if len(tracker_ids) == 0 or len(raw_positions) == 0:
+                            return raw_positions
 
-                                smoothed = []
-                                for tid, pos in zip(tracker_ids, raw_positions):
-                                    key = f"{tid}"
-                                    if key not in radar_positions_history:
-                                        radar_positions_history[key] = deque(maxlen=window_size)
+                        smoothed = []
+                        for tid, pos in zip(tracker_ids, raw_positions):
+                            key = f"{tid}"
+                            if key not in radar_positions_history:
+                                radar_positions_history[key] = deque(maxlen=window_size)
 
-                                    radar_positions_history[key].append(pos)
-                                    avg_pos = np.mean(list(radar_positions_history[key]), axis=0)
-                                    smoothed.append(avg_pos)
+                            radar_positions_history[key].append(pos)
+                            avg_pos = np.mean(list(radar_positions_history[key]), axis=0)
+                            smoothed.append(avg_pos)
 
-                                return np.array(smoothed)
+                        return np.array(smoothed)
 
-                            # Transformar y suavizar Team 1
-                            if any(team1_mask):
-                                t1_dets = tracked_persons[np.array(team1_mask)]
-                                t1_raw = transformer.transform_points(get_bottom_center(t1_dets))
-                                if t1_dets.tracker_id is not None:
-                                    points_to_transform['team1'] = smooth_positions(
-                                        t1_dets.tracker_id, t1_raw, RADAR_SMOOTH_WINDOW
-                                    )
-                                else:
-                                    points_to_transform['team1'] = t1_raw
+                    # Transformar y suavizar Team 1
+                    if any(team1_mask):
+                        t1_dets = tracked_persons[np.array(team1_mask)]
+                        t1_raw = transformer.transform_points(get_bottom_center(t1_dets))
+                        if t1_dets.tracker_id is not None:
+                            points_to_transform['team1'] = smooth_positions(
+                                t1_dets.tracker_id, t1_raw, RADAR_SMOOTH_WINDOW
+                            )
+                        else:
+                            points_to_transform['team1'] = t1_raw
 
-                            # Transformar y suavizar Team 2
-                            if any(team2_mask):
-                                t2_dets = tracked_persons[np.array(team2_mask)]
-                                t2_raw = transformer.transform_points(get_bottom_center(t2_dets))
-                                if t2_dets.tracker_id is not None:
-                                    points_to_transform['team2'] = smooth_positions(
-                                        t2_dets.tracker_id, t2_raw, RADAR_SMOOTH_WINDOW
-                                    )
-                                else:
-                                    points_to_transform['team2'] = t2_raw
+                    # Transformar y suavizar Team 2
+                    if any(team2_mask):
+                        t2_dets = tracked_persons[np.array(team2_mask)]
+                        t2_raw = transformer.transform_points(get_bottom_center(t2_dets))
+                        if t2_dets.tracker_id is not None:
+                            points_to_transform['team2'] = smooth_positions(
+                                t2_dets.tracker_id, t2_raw, RADAR_SMOOTH_WINDOW
+                            )
+                        else:
+                            points_to_transform['team2'] = t2_raw
 
-                            # Referee (sin suavizado, se mueven menos)
-                            if any(referee_mask):
-                                points_to_transform['referee'] = transformer.transform_points(
-                                    get_bottom_center(tracked_persons[np.array(referee_mask)])
-                                )
+                    # Referee (sin suavizado, se mueven menos)
+                    if any(referee_mask):
+                        points_to_transform['referee'] = transformer.transform_points(
+                            get_bottom_center(tracked_persons[np.array(referee_mask)])
+                        )
 
-                            # Goalkeeper (sin suavizado, se mueven menos)
-                            if any(goalkeeper_mask):
-                                points_to_transform['goalkeeper'] = transformer.transform_points(
-                                    get_bottom_center(tracked_persons[np.array(goalkeeper_mask)])
-                                )
+                    # Goalkeeper (sin suavizado, se mueven menos)
+                    if any(goalkeeper_mask):
+                        points_to_transform['goalkeeper'] = transformer.transform_points(
+                            get_bottom_center(tracked_persons[np.array(goalkeeper_mask)])
+                        )
 
-                            # Ball con ventana más corta (movimiento rápido)
-                            if tracked_ball is not None and len(tracked_ball) > 0:
-                                ball_raw = transformer.transform_points(get_bottom_center(tracked_ball))
-                                if tracked_ball.tracker_id is not None:
-                                    points_to_transform['ball'] = smooth_positions(
-                                        tracked_ball.tracker_id, ball_raw, RADAR_SMOOTH_WINDOW_BALL
-                                    )
-                                else:
-                                    points_to_transform['ball'] = ball_raw
+                    # Ball con ventana más corta (movimiento rápido)
+                    if tracked_ball is not None and len(tracked_ball) > 0:
+                        ball_raw = transformer.transform_points(get_bottom_center(tracked_ball))
+                        if tracked_ball.tracker_id is not None:
+                            points_to_transform['ball'] = smooth_positions(
+                                tracked_ball.tracker_id, ball_raw, RADAR_SMOOTH_WINDOW_BALL
+                            )
+                        else:
+                            points_to_transform['ball'] = ball_raw
 
-                            radar_view = draw_radar_view(pitch_config, points_to_transform)
-                            
-                            # Overlay PIP
-                            scale_factor = 0.3 # 30% del ancho
-                            new_w = int(width * scale_factor)
-                            aspect_ratio = radar_view.shape[0] / radar_view.shape[1]
-                            new_h = int(new_w * aspect_ratio)
-                            
-                            radar_resized = cv2.resize(radar_view, (new_w, new_h))
-                            
-                            # Posición: Abajo al centro
-                            offset_x = (width - new_w) // 2
-                            offset_y = height - new_h - 20
-                            
-                            if offset_y > 0:
-                                annotated_frame[offset_y:offset_y+new_h, offset_x:offset_x+new_w] = radar_resized
+                    radar_view = draw_radar_view(pitch_config, points_to_transform)
+                    
+                    # Overlay PIP
+                    scale_factor = 0.3 # 30% del ancho
+                    new_w = int(width * scale_factor)
+                    aspect_ratio = radar_view.shape[0] / radar_view.shape[1]
+                    new_h = int(new_w * aspect_ratio)
+                    
+                    radar_resized = cv2.resize(radar_view, (new_w, new_h))
+                    
+                    # Posición: Abajo al centro
+                    offset_x = (width - new_w) // 2
+                    offset_y = height - new_h - 20
+                    
+                    if offset_y > 0:
+                        annotated_frame[offset_y:offset_y+new_h, offset_x:offset_x+new_w] = radar_resized
                 except Exception as e:
                     print(f"Error en Radar: {e}")
 

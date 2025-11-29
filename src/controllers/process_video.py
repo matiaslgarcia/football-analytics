@@ -6,6 +6,7 @@ from sklearn.cluster import KMeans
 from collections import deque, Counter
 from src.utils.view_transformer import ViewTransformer
 from src.utils.radar import SoccerPitchConfiguration, draw_radar_view
+from src.utils.soccernet_homography import load_homography_for_video, load_homography_provider
 from ultralytics import YOLO
 
 
@@ -519,6 +520,8 @@ def process_video(
     """
     source_path = str(source_path)
     target_path = str(target_path)
+    soccernet_H = load_homography_for_video(source_path)
+    soccernet_provider = load_homography_provider(source_path)
 
     cap = cv2.VideoCapture(source_path)
     if not cap.isOpened():
@@ -535,9 +538,9 @@ def process_video(
     person_tracker = sv.ByteTrack()
     ball_tracker = sv.ByteTrack()
 
-    # Configurar modelo de pitch si se proporciona O si se usa aproximación
+    # Configurar modelo de pitch si se proporciona / aproximación / homografía previa
     pitch_config = None
-    if pitch_model or full_field_approx:
+    if pitch_model or full_field_approx or soccernet_H is not None:
         pitch_config = SoccerPitchConfiguration()
 
     # Anotadores
@@ -829,11 +832,17 @@ def process_video(
                 annotated_frame = ball_label_annotator.annotate(scene=annotated_frame, detections=tracked_ball, labels=ball_labels)
 
             # --- RADAR ---
-            if pitch_config:  # Si hay configuración de pitch (ya sea por modelo o approx)
+            if pitch_config:  # Si hay configuración de pitch (modelo/approx/homografía)
                 transformer = None
+                if soccernet_provider is not None:
+                    m = soccernet_provider.get_for_time(frame_count / fps)
+                    if m is not None:
+                        transformer = ViewTransformer.from_matrix(m)
+                elif soccernet_H is not None:
+                    transformer = ViewTransformer.from_matrix(soccernet_H)
                 
                 # Caso A: Modelo de Pitch disponible
-                if pitch_model:
+                if transformer is None and pitch_model:
                     try:
                         pitch_results = pitch_model(frame, verbose=False, conf=0.3)[0]
                         if pitch_results.keypoints is not None and len(pitch_results.keypoints) > 0:
@@ -851,7 +860,7 @@ def process_video(
                         print(f"Error en inferencia de pitch: {e}")
 
                 # Caso B: Aproximación de Campo Completo (MEJORADA)
-                elif full_field_approx:
+                if transformer is None and full_field_approx:
                     # Mejora: Usar márgenes para ajustar mejor la vista de cámara
                     # Las cámaras de broadcast no muestran exactamente el campo completo
                     # Típicamente hay ~5-10% de margen en los bordes

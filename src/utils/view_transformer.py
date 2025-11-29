@@ -18,6 +18,12 @@ class ViewTransformer:
         else:
             self.m = None
 
+    @classmethod
+    def from_matrix(cls, H: np.ndarray):
+        obj = cls.__new__(cls)
+        obj.m = H.astype(np.float32)
+        return obj
+
     def transform_points(self, points: np.ndarray) -> np.ndarray:
         """
         Transform points from source perspective to target perspective.
