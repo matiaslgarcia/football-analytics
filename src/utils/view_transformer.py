@@ -18,19 +18,28 @@ class ViewTransformer:
         else:
             self.m = None
 
-    def transform_points(self, points: np.ndarray) -> np.ndarray:
+    def transform_points(self, points: np.ndarray, flip_x: bool = False) -> np.ndarray:
         """
         Transform points from source perspective to target perspective.
-        
+
         Args:
             points: Array of shape (N, 2) containing points to transform.
-            
+            flip_x: If True, inverts X coordinates (105 - x) to match broadcast view.
+
         Returns:
             Transformed points of shape (N, 2).
         """
         if self.m is None or points is None or points.size == 0:
             return points
-        
+
         reshaped_points = points.reshape(-1, 1, 2).astype(np.float32)
         transformed_points = cv2.perspectiveTransform(reshaped_points, self.m)
-        return transformed_points.reshape(-1, 2)
+        transformed_points = transformed_points.reshape(-1, 2)
+
+        # Invertir eje X para que coincida con la vista de broadcast
+        # En broadcast: equipo de la izquierda ataca hacia la derecha
+        # Sin inversión: el radar muestra el campo al revés
+        if flip_x:
+            transformed_points[:, 0] = 105.0 - transformed_points[:, 0]
+
+        return transformed_points

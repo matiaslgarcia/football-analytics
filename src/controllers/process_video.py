@@ -4,8 +4,12 @@ import supervision as sv
 from typing import Dict, Tuple, List
 from sklearn.cluster import KMeans
 from collections import deque, Counter
+import json
+from pathlib import Path
 from src.utils.view_transformer import ViewTransformer
 from src.utils.radar import SoccerPitchConfiguration, draw_radar_view
+from src.controllers.formation_detector import FormationDetector
+from src.controllers.tactical_metrics import TacticalMetricsCalculator, TacticalMetricsTracker
 from ultralytics import YOLO
 
 
@@ -537,8 +541,31 @@ def process_video(
 
     # Configurar modelo de pitch si se proporciona O si se usa aproximación
     pitch_config = None
+    pitch_model_type = 'default'  # Default fallback
+
     if pitch_model or full_field_approx:
-        pitch_config = SoccerPitchConfiguration()
+        # Detectar automáticamente el tipo de modelo basado en número de keypoints
+        if pitch_model:
+            try:
+                # Hacer inferencia en un frame vacío para detectar estructura del modelo
+                test_results = pitch_model(np.zeros((640, 640, 3), dtype=np.uint8), verbose=False)
+                if test_results and test_results[0].keypoints is not None:
+                    num_keypoints = test_results[0].keypoints.data.shape[1] if len(test_results[0].keypoints.data.shape) > 1 else 0
+
+                    # Determinar tipo de modelo por número de keypoints
+                    if num_keypoints == 29:
+                        pitch_model_type = 'soccana'
+                        print(f"✅ Modelo Soccana detectado: {num_keypoints} keypoints")
+                    elif num_keypoints == 32:
+                        pitch_model_type = 'roboflow'  # homography.pt tiene 32 kps como roboflow
+                        print(f"✅ Modelo Homography/Roboflow detectado: {num_keypoints} keypoints")
+                    else:
+                        print(f"⚠️ Modelo desconocido con {num_keypoints} keypoints, usando default")
+            except Exception as e:
+                print(f"⚠️ No se pudo detectar tipo de modelo: {e}, usando default")
+
+        # Crear configuración con el tipo correcto
+        pitch_config = SoccerPitchConfiguration(model_type=pitch_model_type)
 
     # Anotadores
     team1_annotator = sv.BoxAnnotator(color=sv.Color.from_hex("#00FF00"), thickness=2)
@@ -569,6 +596,13 @@ def process_video(
     # Suavizado temporal para posiciones en radar
     radar_positions_history = {}  # tracker_id -> deque de posiciones (x, y)
     RADAR_SMOOTH_WINDOW = 5       # Ventana de suavizado (5 frames)
+
+    # Inicializar módulos tácticos
+    formation_detector = FormationDetector()
+    metrics_calculator = TacticalMetricsCalculator()
+    team1_tracker = TacticalMetricsTracker(history_size=5000)
+    team2_tracker = TacticalMetricsTracker(history_size=5000)
+    formations_timeline = {'team1': [], 'team2': []}
 
     # --- IDENTIFICAR CLASES DEL MODELO DE JUGADORES ---
     player_model_names = player_model.names
@@ -835,23 +869,61 @@ def process_video(
                 # Caso A: Modelo de Pitch disponible
                 if pitch_model:
                     try:
-                        pitch_results = pitch_model(frame, verbose=False, conf=0.3)[0]
+                        # Usar un umbral bajo para la inferencia inicial (conf=0.01)
+                        # para no perder keypoints que podrían ser válidos para Soccana (que usa 0.05)
+                        pitch_results = pitch_model(frame, verbose=False, conf=0.01)[0]
                         if pitch_results.keypoints is not None and len(pitch_results.keypoints) > 0:
                             keypoints_xy = pitch_results.keypoints.xy.cpu().numpy()[0]
                             keypoints_conf = pitch_results.keypoints.conf.cpu().numpy()[0]
-                            
-                            valid_kp_mask = keypoints_conf > 0.5
+
+                            # Umbral adaptativo optimizado:
+                            # Soccana: 0.05 para capturar keypoints de áreas penales (baja confianza)
+                            # Roboflow: 0.5 (alta confianza requerida)
+                            conf_threshold = 0.05 if pitch_model_type == 'soccana' else 0.5
+                            valid_kp_mask = keypoints_conf > conf_threshold
                             valid_keypoints = keypoints_xy[valid_kp_mask]
                             valid_indices = np.where(valid_kp_mask)[0]
-                            
+
+                            # Filtrar keypoints que NO tienen mapeo en la configuración del pitch
+                            # Esto es crucial si el modelo detecta keypoints que no están en el mapa (ej. modelo Roboflow sin librería sports)
+                            mapped_indices_mask = np.isin(valid_indices, list(pitch_config.keypoints_map.keys()))
+                            valid_indices = valid_indices[mapped_indices_mask]
+                            valid_keypoints = valid_keypoints[mapped_indices_mask]
+
+                            # Usar todos los keypoints válidos (RANSAC manejará outliers)
                             if len(valid_keypoints) >= 4:
-                                target_points = pitch_config.get_keypoints_from_ids(valid_indices)
-                                transformer = ViewTransformer(valid_keypoints, target_points)
+                                # Verificar distribución de keypoints (no solo círculo central)
+                                # Calcular dispersión en X e Y
+                                x_range = valid_keypoints[:, 0].max() - valid_keypoints[:, 0].min()
+                                y_range = valid_keypoints[:, 1].max() - valid_keypoints[:, 1].min()
+
+                                # Si los keypoints están muy concentrados (solo círculo central),
+                                # la homografía será inestable
+                                min_spread = width * 0.3  # Al menos 30% del ancho
+                                well_distributed = x_range > min_spread or y_range > min_spread
+
+                                if well_distributed:
+                                    target_points = pitch_config.get_keypoints_from_ids(valid_indices)
+                                    transformer = ViewTransformer(valid_keypoints, target_points)
+
+                                    # Verificar si la homografía se calculó correctamente
+                                    if transformer.m is None:
+                                        if frame_count % 100 == 0:
+                                            print(f"Frame {frame_count}: Homografía fallida (matriz singular), usando aproximación")
+                                        transformer = None
+                                    elif frame_count % 100 == 0:
+                                        print(f"Frame {frame_count}: Homografía OK con {len(valid_keypoints)} keypoints")
+                                else:
+                                    if frame_count % 100 == 0:
+                                        print(f"Frame {frame_count}: Keypoints mal distribuidos (spread: {x_range:.0f}x{y_range:.0f}), usando aproximación")
+                                    transformer = None
                     except Exception as e:
-                        print(f"Error en inferencia de pitch: {e}")
+                        if frame_count % 100 == 0:
+                            print(f"Error en inferencia de pitch (frame {frame_count}): {e}")
 
                 # Caso B: Aproximación de Campo Completo (MEJORADA)
-                elif full_field_approx:
+                # Se usa si: 1) full_field_approx=True, o 2) modelo de pitch falló
+                if transformer is None and (full_field_approx or pitch_model):
                     # Mejora: Usar márgenes para ajustar mejor la vista de cámara
                     # Las cámaras de broadcast no muestran exactamente el campo completo
                     # Típicamente hay ~5-10% de margen en los bordes
@@ -870,13 +942,15 @@ def process_video(
                         [margin_left, height - margin_bottom]               # Bottom-Left (ajustado)
                     ], dtype=np.float32)
 
-                    # Mapear a las esquinas del campo
-                    # Campo estándar: 105m x 68m
+                    # Mapear a las esquinas del campo usando el método correcto
+                    # Esto funciona tanto con Roboflow Sports (IDs: 0, 5, 29, 24)
+                    # como con configuración default (IDs: 0, 1, 2, 3)
+                    corner_ids = pitch_config.get_corner_keypoint_ids()
                     target_points = np.array([
-                        pitch_config.keypoints_map[0],  # Top-Left corner
-                        pitch_config.keypoints_map[1],  # Top-Right corner
-                        pitch_config.keypoints_map[2],  # Bottom-Right corner
-                        pitch_config.keypoints_map[3]   # Bottom-Left corner
+                        pitch_config.keypoints_map[corner_ids[0]],  # Top-Left corner
+                        pitch_config.keypoints_map[corner_ids[1]],  # Top-Right corner
+                        pitch_config.keypoints_map[corner_ids[2]],  # Bottom-Right corner
+                        pitch_config.keypoints_map[corner_ids[3]]   # Bottom-Left corner
                     ], dtype=np.float32)
 
                     transformer = ViewTransformer(source_points, target_points)
@@ -905,19 +979,19 @@ def process_video(
                                 smoothed.append(avg_pos)
                             return np.array(smoothed)
 
-                        # Transformar y suavizar team1
+                        # Transformar y suavizar team1 (con flip_x para corregir inversión)
                         if any(team1_mask):
                             t1_dets = tracked_persons[np.array(team1_mask)]
-                            raw_pos = transformer.transform_points(get_bottom_center(t1_dets))
+                            raw_pos = transformer.transform_points(get_bottom_center(t1_dets), flip_x=True)
                             if t1_dets.tracker_id is not None:
                                 points_to_transform['team1'] = smooth_positions(t1_dets.tracker_id, raw_pos)
                             else:
                                 points_to_transform['team1'] = raw_pos
 
-                        # Transformar y suavizar team2
+                        # Transformar y suavizar team2 (con flip_x para corregir inversión)
                         if any(team2_mask):
                             t2_dets = tracked_persons[np.array(team2_mask)]
-                            raw_pos = transformer.transform_points(get_bottom_center(t2_dets))
+                            raw_pos = transformer.transform_points(get_bottom_center(t2_dets), flip_x=True)
                             if t2_dets.tracker_id is not None:
                                 points_to_transform['team2'] = smooth_positions(t2_dets.tracker_id, raw_pos)
                             else:
@@ -927,19 +1001,19 @@ def process_video(
                         if any(referee_mask):
                             ref_dets = tracked_persons[np.array(referee_mask)]
                             points_to_transform['referee'] = transformer.transform_points(
-                                get_bottom_center(ref_dets)
+                                get_bottom_center(ref_dets), flip_x=True
                             )
 
                         # Transformar porteros
                         if any(goalkeeper_mask):
                             gk_dets = tracked_persons[np.array(goalkeeper_mask)]
                             points_to_transform['goalkeeper'] = transformer.transform_points(
-                                get_bottom_center(gk_dets)
+                                get_bottom_center(gk_dets), flip_x=True
                             )
 
                         # Transformar pelota (suavizado agresivo por su movimiento rápido)
                         if tracked_ball is not None and len(tracked_ball) > 0:
-                            raw_ball_pos = transformer.transform_points(get_bottom_center(tracked_ball))
+                            raw_ball_pos = transformer.transform_points(get_bottom_center(tracked_ball), flip_x=True)
                             if tracked_ball.tracker_id is not None and len(tracked_ball.tracker_id) > 0:
                                 ball_tid = tracked_ball.tracker_id[0]
                                 if ball_tid not in radar_positions_history:
@@ -949,25 +1023,91 @@ def process_video(
                                 points_to_transform['ball'] = np.array([smooth_ball])
                             else:
                                 points_to_transform['ball'] = raw_ball_pos
-                            
-                        radar_view = draw_radar_view(pitch_config, points_to_transform)
                         
-                        scale_factor = 0.3
+                        # --- ACTUALIZACIÓN DE MÉTRICAS TÁCTICAS ---
+                        if 'team1' in points_to_transform and len(points_to_transform['team1']) > 0:
+                            formation1 = formation_detector.detect_formation(points_to_transform['team1'])
+                            formations_timeline['team1'].append(formation1)
+                            
+                            metrics1 = metrics_calculator.calculate_all_metrics(points_to_transform['team1'])
+                            team1_tracker.update(metrics1, frame_count)
+                            
+                        if 'team2' in points_to_transform and len(points_to_transform['team2']) > 0:
+                            formation2 = formation_detector.detect_formation(points_to_transform['team2'])
+                            formations_timeline['team2'].append(formation2)
+                            
+                            metrics2 = metrics_calculator.calculate_all_metrics(points_to_transform['team2'])
+                            team2_tracker.update(metrics2, frame_count)
+                            
+                        radar_view = draw_radar_view(pitch_config, points_to_transform, scale=8)
+
+                        # Mantener horizontal (sin rotación)
+                        # Tamaño: 22% del ancho (reducido para no molestar)
+                        scale_factor = 0.22
                         new_w = int(width * scale_factor)
                         aspect_ratio = radar_view.shape[0] / radar_view.shape[1]
                         new_h = int(new_w * aspect_ratio)
-                        
+
                         radar_resized = cv2.resize(radar_view, (new_w, new_h))
-                        
-                        offset_x = (width - new_w) // 2
-                        offset_y = height - new_h - 20
-                        
-                        if offset_y > 0:
-                            annotated_frame[offset_y:offset_y+new_h, offset_x:offset_x+new_w] = radar_resized
+
+                        # Posición: esquina inferior derecha
+                        margin_bottom = 20
+                        margin_right = 20
+                        offset_x = width - new_w - margin_right  # Esquina derecha con margen
+                        offset_y = height - new_h - margin_bottom  # Abajo con margen
+
+                        # Verificar que cabe en el frame
+                        if offset_y >= 0 and offset_x >= 0:
+                            # Aplicar transparencia (alpha blending)
+                            alpha = 0.65  # 65% radar, 35% video
+                            roi = annotated_frame[offset_y:offset_y+new_h, offset_x:offset_x+new_w]
+                            blended = cv2.addWeighted(roi, 1-alpha, radar_resized, alpha, 0)
+                            annotated_frame[offset_y:offset_y+new_h, offset_x:offset_x+new_w] = blended
                     except Exception as e:
                         print(f"Error dibujando radar: {e}")
 
             out.write(annotated_frame)
+
+        # --- GENERAR ESTADÍSTICAS FINALES ---
+        print("Generando estadísticas tácticas...")
+
+        def get_dominant_formation(formations_list):
+            if not formations_list: return "Unknown"
+            formation_names = [f.get('formation', 'Unknown') for f in formations_list]
+            if not formation_names: return "Unknown"
+            return Counter(formation_names).most_common(1)[0][0]
+
+        # Calcular estadísticas agregadas de métricas
+        team1_stats = team1_tracker.get_statistics()
+        team2_stats = team2_tracker.get_statistics()
+
+        stats_data = {
+            'total_frames': frame_count,
+            'duration_seconds': frame_count / fps if fps > 0 else 0,
+            'formations': {
+                'team1': {
+                    'most_common': get_dominant_formation(formations_timeline['team1']),
+                    'timeline': [f.get('formation', 'Unknown') for f in formations_timeline['team1']]
+                },
+                'team2': {
+                    'most_common': get_dominant_formation(formations_timeline['team2']),
+                    'timeline': [f.get('formation', 'Unknown') for f in formations_timeline['team2']]
+                }
+            },
+            'metrics': {
+                'team1': team1_stats,
+                'team2': team2_stats
+            },
+            'timeline': {
+                'team1': team1_tracker.export_to_dict(),
+                'team2': team2_tracker.export_to_dict()
+            }
+        }
+
+        stats_path = Path(target_path).parent / f"{Path(target_path).stem}_stats.json"
+        with open(stats_path, 'w') as f:
+            json.dump(stats_data, f, indent=2)
+        print(f"Estadísticas guardadas en: {stats_path}")
 
     finally:
         cap.release()
